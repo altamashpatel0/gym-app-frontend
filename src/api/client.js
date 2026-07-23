@@ -35,8 +35,11 @@ export const authAPI = {
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 export const dashboardAPI = {
-  stats: () => client.get("/api/dashboard/stats"),
-  expiringMembers: () => client.get("/api/dashboard/expiring-members"),
+  // NEW: both accept an optional { shift: "Day" | "Night" } param so the
+  // dashboard can scope every stat to a shift. Omitting it (or passing {})
+  // keeps the old "all members" behavior.
+  stats: (params) => client.get("/api/dashboard/stats", { params }),
+  expiringMembers: (params) => client.get("/api/dashboard/expiring-members", { params }),
 };
 
 // ── Members ───────────────────────────────────────────────────────────────────

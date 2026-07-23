@@ -3,32 +3,16 @@ import { Users, UserCheck, Clock, Banknote, AlertTriangle, UserX, UserPlus, Cred
 import { AppLayout } from "../components/layout/AppLayout";
 import { StatCard, Spinner, Badge } from "../components/ui";
 import { dashboardAPI, attendanceAPI, membersAPI } from "../api/client";
-import { format, differenceInDays } from "date-fns";
+import { format } from "date-fns";
 import { FloatingActionMenu } from "../components/ui/FloatingActionMenu";
+import { getMemberStatus, getDaysLeft } from "../utils/renewal";
 
-// ── Shared renewal logic (must stay identical to MemberList.jsx) ──────────────
-function getMemberStatus(member) {
-  if (member.status === "expired") return "expired";
-  if (member.status === "active" && member.renewal_date) {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const renewal = new Date(member.renewal_date);
-    renewal.setHours(0, 0, 0, 0);
-    const days = differenceInDays(renewal, today);
-    if (days < 0) return "expired";
-    if (days <= 7) return "expiring_soon";
-  }
-  return member.status || "active";
-}
-
-function getDaysLeft(date) {
-  if (!date) return null;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return differenceInDays(d, today);
-}
+// NEW: dashboard-level shift filter options ("All" plus the two shifts)
+const DASHBOARD_SHIFT_TABS = [
+  { value: "", label: "All" },
+  { value: "Day", label: "Day" },
+  { value: "Night", label: "Night" },
+];
 
 export default function Dashboard() {
   const [allMembers, setAllMembers] = useState([]);
@@ -36,14 +20,20 @@ export default function Dashboard() {
   const [collectionStats, setCollectionStats] = useState(null);
   const [loading, setLoading] = useState(true);
   const [fabOpen, setFabOpen] = useState(false);
+  const [shiftFilter, setShiftFilter] = useState(""); // NEW — "" = All, "Day", or "Night"
 
   useEffect(() => {
     const load = async () => {
+      setLoading(true);
       try {
+        // NEW: shift param scopes the member list + stats totals; omitted
+        // (empty string) means "All" and matches prior behavior.
+        const shiftParams = shiftFilter ? { shift: shiftFilter } : {};
+
         const [membersRes, att, statsRes] = await Promise.all([
-          membersAPI.list({ limit: 10000, page: 1 }),
+          membersAPI.list({ limit: 10000, page: 1, ...shiftParams }),
           attendanceAPI.today(),
-          dashboardAPI.stats().catch(() => ({ data: null })),
+          dashboardAPI.stats(shiftParams).catch(() => ({ data: null })),
         ]);
 
         const raw = membersRes.data;
@@ -61,7 +51,7 @@ export default function Dashboard() {
       }
     };
     load();
-  }, []);
+  }, [shiftFilter]);
 
   const totalMembers   = allMembers.length;
   const activeMembers  = allMembers.filter((m) => getMemberStatus(m) === "active").length;
@@ -96,8 +86,26 @@ export default function Dashboard() {
 
   return (
     <AppLayout title="Dashboard">
+      {/* NEW: shift filter — scopes every stat card + table below to a shift.
+          Responsive: full-width segmented control on mobile, fit-content on desktop. */}
+      <div className="flex mb-4 bg-surface-muted border border-surface-border rounded-lg p-1 w-full sm:w-fit">
+        {DASHBOARD_SHIFT_TABS.map((tab) => (
+          <button
+            key={tab.value || "all"}
+            onClick={() => setShiftFilter(tab.value)}
+            className={`flex-1 sm:flex-none px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+              shiftFilter === tab.value
+                ? "bg-brand-500 text-white shadow-sm"
+                : "text-gray-400 hover:text-gray-200"
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
       {/* Stats grid */}
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <StatCard title="Total Members"    value={totalMembers}   icon={Users}     color="brand" />
         <StatCard title="Active"           value={activeMembers}  icon={UserCheck} color="green" />
         <StatCard
@@ -113,6 +121,27 @@ export default function Dashboard() {
           value={`₹${Number(collectionStats?.today_collection || 0).toLocaleString("en-IN")}`}
           icon={Banknote}
           color="green"
+        />
+        <StatCard
+          title="Lifetime Collection"
+          value={`₹${Number(collectionStats?.total_revenue || 0).toLocaleString("en-IN")}`}
+          icon={Banknote}
+          color="green"
+        />
+        {/* NEW: Day / Night member counts — always computed by the backend
+            across all members, independent of the shiftFilter toggle above,
+            so the two counts stay meaningful no matter which tab is active. */}
+        <StatCard
+          title="Day Members"
+          value={collectionStats?.day_members ?? 0}
+          icon={Clock}
+          color="brand"
+        />
+        <StatCard
+          title="Night Members"
+          value={collectionStats?.night_members ?? 0}
+          icon={Clock}
+          color="brand"
         />
       </div>
 

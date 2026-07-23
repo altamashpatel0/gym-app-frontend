@@ -4,9 +4,10 @@ import toast from "react-hot-toast";
 import { AppLayout } from "../../components/layout/AppLayout";
 import { Button, Modal, Badge, FormField, Select, Spinner, EmptyState, ConfirmDialog } from "../../components/ui/index";
 import { paymentsAPI, membersAPI, plansAPI } from "../../api/client";
-import { format, addMonths, isSameMonth, isAfter, isBefore, startOfMonth, endOfMonth, differenceInDays } from "date-fns";
+import { format, isSameMonth, isAfter, isBefore, startOfMonth, endOfMonth } from "date-fns";
 import { FloatingActionMenu } from "../../components/ui/FloatingActionMenu";
 import { exportToExcel } from "../../utils/exportExcel";
+import { calcRenewalDate, getOverdueDays } from "../../utils/renewal";
 
 const MODE_OPTS = [
   { value: "cash", label: "Cash" },
@@ -77,9 +78,11 @@ export default function PaymentList() {
     if (k === "plan_id" && e.target.value) {
       const plan = plans.find((p) => p.id === parseInt(e.target.value));
       if (plan) {
-        const from = new Date(updated.valid_from || new Date());
+        const from = updated.valid_from || format(new Date(), "yyyy-MM-dd");
         updated.amount = plan.price;
-        updated.valid_to = format(addMonths(from, plan.duration_months), "yyyy-MM-dd");
+        // duration_months -> duration_days via the shared plan mapping,
+        // then valid_to = valid_from + duration_days (not month arithmetic).
+        updated.valid_to = calcRenewalDate(from, plan.duration_months);
       }
     }
     setForm(updated);
@@ -307,11 +310,7 @@ export default function PaymentList() {
                 </thead>
                 <tbody>
                   {dues.map((d) => {
-                    const overdueDays = d.days_overdue || (
-                      d.renewal_date
-                        ? Math.max(0, differenceInDays(now, new Date(d.renewal_date)))
-                        : 0
-                    );
+                    const overdueDays = d.days_overdue || getOverdueDays(d.renewal_date);
                     return (
                       <tr key={d.member_id} className="table-row">
                         <td className="table-td">

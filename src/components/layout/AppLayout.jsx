@@ -2,7 +2,7 @@ import { NavLink, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard, Users, CreditCard, Calendar, UserCheck,
   BarChart2, Bell, Dumbbell, LogOut, Menu, X, ChevronRight,
-  Settings
+  Settings, MessageCircle
 } from "lucide-react";
 import { useState } from "react";
 import useAuthStore from "../../store/authStore";
@@ -13,6 +13,7 @@ const NAV = [
   { to: "/plans",        label: "Plans",        icon: Dumbbell },
   { to: "/payments",     label: "Payments",     icon: CreditCard },
   { to: "/attendance",   label: "Attendance",   icon: UserCheck },
+  { to: "/whatsapp",     label: "WhatsApp Center", icon: MessageCircle },
   { to: "/staff",        label: "Staff",        icon: Settings,  roles: ["owner", "admin"] },
   { to: "/reports",      label: "Reports",      icon: BarChart2, roles: ["owner", "admin"] },
   { to: "/notifications", label: "Notifications", icon: Bell },

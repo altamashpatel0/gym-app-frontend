@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Camera, CameraResultType, CameraSource } from "@capacitor/camera";
-import { Plus, Edit2, Trash2, Camera as CameraIcon, Upload, FolderOpen, FileText, Loader2, X, ExternalLink, Eye, UserPlus, FileSpreadsheet } from "lucide-react";
+import { Plus, Edit2, Trash2, Camera as CameraIcon, Upload, FolderOpen, FileText, Loader2, X, ExternalLink, Eye, UserPlus, FileSpreadsheet, Sun, Moon } from "lucide-react";
 import { FloatingActionMenu } from "../../components/ui/FloatingActionMenu";
 import toast from "react-hot-toast";
 import { AppLayout } from "../../components/layout/AppLayout";
@@ -9,48 +9,10 @@ import {
   ConfirmDialog, FormField, Select, EmptyState, Spinner
 } from "../../components/ui/index";
 import { membersAPI, plansAPI, mediaAPI } from "../../api/client";
-import { format, differenceInDays, addMonths } from "date-fns";
+import { format } from "date-fns";
 import useAuthStore from "../../store/authStore";
 import { exportToExcel } from "../../utils/exportExcel";
-
-// ── Renewal date auto-calculation ──────────────────────────────────────────────
-function getPlanMonths(planName) {
-  if (!planName) return null;
-  const match = planName.match(/(\d+)\s*month/i);
-  return match ? parseInt(match[1]) : null;
-}
-
-function calcRenewalDate(joinDate, planName) {
-  if (!joinDate || !planName) return "";
-  const months = getPlanMonths(planName);
-  if (!months) return "";
-  const result = addMonths(new Date(joinDate), months);
-  return format(result, "yyyy-MM-dd");
-}
-
-// ── Renewal countdown label + color ───────────────────────────────────────────
-function getRenewalInfo(renewalDate) {
-  if (!renewalDate) return null;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const renewal = new Date(renewalDate);
-  renewal.setHours(0, 0, 0, 0);
-  const days = differenceInDays(renewal, today);
-
-  let label;
-  if (days > 1)        label = `${days} days left`;
-  else if (days === 1) label = "Tomorrow";
-  else if (days === 0) label = "Today expires";
-  else                 label = `Expired ${Math.abs(days)} day${Math.abs(days) !== 1 ? "s" : ""} ago`;
-
-  let cls;
-  if (days > 15)      cls = "text-green-400";
-  else if (days >= 7) cls = "text-yellow-400";
-  else if (days >= 0) cls = "text-orange-400";
-  else                cls = "text-red-400";
-
-  return { label, cls };
-}
+import { calcRenewalDate, getRenewalInfo, getMemberStatus, getDaysLeft } from "../../utils/renewal";
 
 const STATUS_OPTS = [
   { value: "", label: "All Status" },
@@ -66,6 +28,29 @@ const GENDER_OPTS = [
   { value: "other", label: "Other" },
 ];
 
+// ── Filter chip configs (all frontend-only filtering, no backend params) ─────
+// Status/Shift/Plan are combined together with search purely on the client,
+// over whichever page of members is already loaded — no new API calls, no
+// extra query params, no change to request/response shape.
+const STATUS_FILTER_CHIPS = [
+  { value: "", label: "All" },
+  { value: "active", label: "Active" },
+  { value: "expiring_soon", label: "7 Days Expiring" },
+  { value: "paused", label: "Paused" },
+];
+
+const SHIFT_FILTER_CHIPS = [
+  { value: "", label: "All" },
+  { value: "Day", label: "Day" },
+  { value: "Night", label: "Night" },
+];
+
+// ── Shift dropdown options for the Add/Edit member form ──────────────────────
+const SHIFT_OPTS = [
+  { value: "Day", label: "Day" },
+  { value: "Night", label: "Night" },
+];
+
 const DOC_TYPE_OPTS = [
   { value: "", label: "Select type" },
   { value: "aadhaar", label: "Aadhaar" },
@@ -79,19 +64,10 @@ const EMPTY_FORM = {
   name: "", phone: "", email: "", address: "", dob: "",
   gender: "", plan_id: "", join_date: "", renewal_date: "",
   status: "active", assigned_trainer_id: "",
+  shift: "Day", // NEW
 };
 
 const EMPTY_DOC_META = { document_name: "", document_type: "" };
-
-function getMemberStatus(member) {
-  if (member.status === "expired") return "expired";
-  if (member.status === "active" && member.renewal_date) {
-    const days = differenceInDays(new Date(member.renewal_date), new Date());
-    if (days < 0) return "expired";
-    if (days <= 7) return "expiring_soon";
-  }
-  return member.status || "active";
-}
 
 const STATUS_BADGE = {
   active: { cls: "bg-green-500/15 text-green-400 border border-green-500/20", label: "Active" },
@@ -107,6 +83,75 @@ function MemberStatusBadge({ member }) {
     <span className={`inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium ${cfg.cls}`}>
       {cfg.label}
     </span>
+  );
+}
+
+// ── Shift badge (Day = green, Night = blue/purple) ────────────────────────────
+const SHIFT_BADGE = {
+  Day:   { cls: "bg-green-500/15 text-green-400 border border-green-500/20", label: "Day Shift", Icon: Sun },
+  Night: { cls: "bg-purple-500/15 text-purple-400 border border-purple-500/20", label: "Night Shift", Icon: Moon },
+};
+
+function ShiftBadge({ shift }) {
+  const cfg = SHIFT_BADGE[shift];
+  if (!cfg) return null; // gracefully hide if shift is unavailable
+  const { Icon } = cfg;
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium ${cfg.cls}`}>
+      <Icon size={11} />
+      {cfg.label}
+    </span>
+  );
+}
+
+// ── Expiry warning badge (shown below the Shift badge when renewal is ≤7 days) ──
+// Uses getDaysLeft() from the renewal utils — no date math is duplicated here.
+function ExpiryWarningBadge({ renewalDate }) {
+  const days = getDaysLeft(renewalDate);
+  if (days === null || days === undefined || days > 7) return null; // not within the 7-day window
+  const isExpired = days <= 0;
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-semibold whitespace-nowrap ${
+        isExpired
+          ? "bg-red-500/15 text-red-400 border border-red-500/20"
+          : "bg-yellow-500/15 text-yellow-400 border border-yellow-500/20"
+      }`}
+    >
+      {isExpired ? "🔴 Expired" : `🟡 ${days} Day${days === 1 ? "" : "s"} Left`}
+    </span>
+  );
+}
+
+// ── Filter Chips ───────────────────────────────────────────────────────────────
+// Modern chip-based filter row: rounded pill buttons, single-select per group.
+// Selecting "All" (value === "") clears that filter. Horizontally scrollable
+// on overflow (mobile-first) with hidden scrollbar via .chip-scroll below.
+function FilterChips({ label, options, value, onChange }) {
+  if (!options || options.length <= 1) return null; // nothing to filter by yet (e.g. no plans loaded)
+  return (
+    <div className="min-w-0">
+      <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-1.5">{label}</p>
+      <div className="chip-scroll flex gap-2 overflow-x-auto pb-1 -mx-0.5 px-0.5">
+        {options.map((opt) => {
+          const active = opt.value === value;
+          return (
+            <button
+              key={opt.value || `${label}-all`}
+              type="button"
+              onClick={() => onChange(opt.value)}
+              className={`shrink-0 px-3.5 py-1.5 rounded-full text-xs font-medium border whitespace-nowrap
+                transition-all duration-200 ease-out
+                ${active
+                  ? "bg-brand-500 border-brand-500 text-white shadow-sm shadow-brand-500/30"
+                  : "bg-surface-muted border-surface-border text-gray-400 hover:text-gray-200 hover:border-brand-500/40 hover:-translate-y-0.5"}`}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -428,10 +473,11 @@ function MemberViewModal({ member, open, onClose }) {
           <Row label="Age" value={member.age} />
           <Row label="Gender" value={member.gender ? member.gender.charAt(0).toUpperCase() + member.gender.slice(1) : null} />
           <Row label="Plan" value={member.plan?.name} />
+          <Row label="Shift" value={member.shift || null} />
           <Row label="Status" value={statusCfg.label} />
           <Row label="Join Date" value={member.join_date ? format(new Date(member.join_date), "dd MMM yyyy") : null} />
           <Row label="Renewal Date" value={member.renewal_date ? format(new Date(member.renewal_date), "dd MMM yyyy") : null} />
-          <Row label="Address" value={member.address} />
+          <Row label="Notice" value={member.address} />
         </div>
 
         {/* Documents */}
@@ -484,11 +530,17 @@ function MemberViewModal({ member, open, onClose }) {
 export default function MemberList() {
   const { user } = useAuthStore();
   const [members, setMembers] = useState([]);
-  const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
-  const [serialOffset, setSerialOffset] = useState(0);
   const [search, setSearch] = useState("");
+  // Status / Shift / Plan chip filters — all applied entirely on the
+  // frontend against the already-loaded page of members. None of these are
+  // ever sent to the backend as query params; only `search` and `page` are.
   const [statusFilter, setStatusFilter] = useState("");
+  const [shiftFilter, setShiftFilter] = useState("");
+  const [planFilter, setPlanFilter] = useState("");
+  // "Notice Members" — a single toggle chip (not a select group). OFF (default)
+  // shows everyone; ON shows only members with a non-empty `address` (Notice).
+  const [noticeOnly, setNoticeOnly] = useState(false);
   const [plans, setPlans] = useState([]);
   const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState(false);
@@ -529,10 +581,14 @@ export default function MemberList() {
   const load = async () => {
     setLoading(true);
     try {
-      const { data } = await membersAPI.list({ search, status: statusFilter, page, limit: 20 });
+      // Load the COMPLETE member list once with a large limit. Search,
+      // Status, Shift, and Plan are then all applied on this full list on
+      // the frontend, and pagination is derived AFTER filtering — never
+      // before. No new API is called, and no filter params are sent to
+      // the backend; this is the same membersAPI.list() call as before,
+      // just without page/search/status query params.
+      const { data } = await membersAPI.list({ limit: 10000 });
       setMembers(data.items);
-      setTotal(data.total);
-      setSerialOffset((page - 1) * 20);
     } finally {
       setLoading(false);
     }
@@ -542,9 +598,66 @@ export default function MemberList() {
     plansAPI.list().then(({ data }) => setPlans(data)).catch(() => {});
   }, []);
 
-  useEffect(() => { load(); }, [search, statusFilter, page]);
+  // Full list is fetched once on mount. It's re-fetched only after a
+  // mutation (add/edit/delete/photo/doc upload) via direct load() calls
+  // elsewhere in this file — never on search/filter/page changes, since
+  // those are now handled entirely on the client.
+  useEffect(() => { load(); }, []);
 
-  const openAdd = () => { setEditing(null); setForm(EMPTY_FORM); setModal(true); };
+  // Chip options for the Plan filter, generated from whatever plans are
+  // already loaded on this page — never hardcoded, never a new API call.
+  const planFilterOptions = useMemo(() => ([
+    { value: "", label: "All" },
+    ...plans.map((p) => ({ value: p.name, label: p.name })),
+  ]), [plans]);
+
+  // ── Filtering pipeline: Load Members → Search → Status → Shift → Plan ──────
+  // Runs over the COMPLETE member list (not just one page), so a filter can
+  // surface matches from any page, not only whatever happened to be loaded.
+  const filteredMembers = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return members.filter((m) => {
+      if (q) {
+        const haystack = `${m.name || ""} ${m.phone || ""} ${m.email || ""}`.toLowerCase();
+        if (!haystack.includes(q)) return false;
+      }
+      if (statusFilter && getMemberStatus(m) !== statusFilter) return false;
+      if (shiftFilter && m.shift !== shiftFilter) return false;
+      if (planFilter && m.plan?.name !== planFilter) return false;
+      if (noticeOnly && !(m.address && m.address.trim())) return false;
+      return true;
+    });
+  }, [members, search, statusFilter, shiftFilter, planFilter, noticeOnly]);
+
+  // ── Pagination applied AFTER filtering ──────────────────────────────────────
+  const PAGE_SIZE = 20;
+  const total = filteredMembers.length;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const serialOffset = (page - 1) * PAGE_SIZE;
+
+  const visibleMembers = useMemo(
+    () => filteredMembers.slice(serialOffset, serialOffset + PAGE_SIZE),
+    [filteredMembers, serialOffset]
+  );
+
+  // Whenever search/status/shift/plan/notice changes, the filtered set can
+  // shrink — jump back to page 1 so the user isn't stuck on an empty page.
+  useEffect(() => { setPage(1); }, [search, statusFilter, shiftFilter, planFilter, noticeOnly]);
+
+  // Safety net: if the current page no longer exists for the filtered set
+  // (e.g. filtered members <= page size, so there's only 1 page), clamp
+  // back to the last valid page instead of showing "No members found".
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+
+  const openAdd = () => {
+    setEditing(null);
+    // New members default to the currently selected shift filter (falls
+    // back to "Day" when "All Shifts" is selected).
+    setForm({ ...EMPTY_FORM, shift: shiftFilter || "Day" });
+    setModal(true);
+  };
   const openEdit = (m) => {
     setEditing(m);
     setForm({
@@ -553,6 +666,7 @@ export default function MemberList() {
       plan_id: m.plan_id || "", join_date: m.join_date || "",
       renewal_date: m.renewal_date || "", status: m.status,
       assigned_trainer_id: m.assigned_trainer_id || "",
+      shift: m.shift || "Day", // NEW
     });
     setModal(true);
   };
@@ -677,23 +791,28 @@ export default function MemberList() {
   };
 
   // ── Export Members ─────────────────────────────────────────────────────────
-  const exportMembers = async () => {
+  const exportMembers = () => {
     const toastId = toast.loading("Exporting members…");
     try {
-      const { data } = await membersAPI.list({ search, status: statusFilter, limit: 10000 });
-      const rows = (data.items || []).map((m) => ({
+      // The full list is already loaded in `members` and filtered into
+      // `filteredMembers` (search + status + shift + plan) — no need for
+      // another API call, we just export whatever the user is currently
+      // looking at (all matching pages, not just the current page).
+      const rows = filteredMembers.map((m) => ({
         Name: m.name,
         Phone: m.phone,
         Email: m.email || "",
         Gender: m.gender || "",
         Age: m.age || "",
         Plan: m.plan?.name || "",
+        Shift: m.shift || "",
         Status: getMemberStatus(m),
         "Join Date": m.join_date ? format(new Date(m.join_date), "dd MMM yyyy") : "",
         "Renewal Date": m.renewal_date ? format(new Date(m.renewal_date), "dd MMM yyyy") : "",
-        Address: m.address || "",
+        Notice: m.address || "",
       }));
-      exportToExcel(rows, "Members");
+      const filterTag = [statusFilter, shiftFilter, planFilter, noticeOnly ? "Notice" : ""].filter(Boolean).join("_") || "All";
+      exportToExcel(rows, `Members_${filterTag}`);
       toast.success("Members exported!", { id: toastId });
     } catch {
       toast.error("Export failed", { id: toastId });
@@ -703,19 +822,24 @@ export default function MemberList() {
   const planOpts = [{ value: "", label: "No plan" }, ...plans.map((p) => ({ value: p.id, label: p.name }))];
   const set = (k) => (e) => setForm((prev) => ({ ...prev, [k]: e.target.value }));
 
-  // Auto-recalculate renewal when join_date changes
+  // Auto-recalculate renewal when join_date changes.
+  // Uses the plan's duration_months (the same field PlanList stores/edits),
+  // NOT the plan display name — the old name-parsing regex silently failed
+  // for any plan not literally containing the word "month" (e.g. a yearly
+  // plan named "Gold Yearly"), which is what caused the countdown to
+  // sometimes freeze or go wrong.
   const handleJoinDateChange = (e) => {
     const joinDate = e.target.value;
-    const planName = plans.find((p) => String(p.id) === String(form.plan_id))?.name || "";
-    const renewal = calcRenewalDate(joinDate, planName);
+    const durationMonths = plans.find((p) => String(p.id) === String(form.plan_id))?.duration_months;
+    const renewal = calcRenewalDate(joinDate, durationMonths);
     setForm((prev) => ({ ...prev, join_date: joinDate, renewal_date: renewal }));
   };
 
   // Auto-recalculate renewal when plan changes
   const handlePlanChange = (e) => {
     const planId = e.target.value;
-    const planName = plans.find((p) => String(p.id) === String(planId))?.name || "";
-    const renewal = calcRenewalDate(form.join_date, planName);
+    const durationMonths = plans.find((p) => String(p.id) === String(planId))?.duration_months;
+    const renewal = calcRenewalDate(form.join_date, durationMonths);
     setForm((prev) => ({ ...prev, plan_id: planId, renewal_date: renewal }));
   };
 
@@ -724,25 +848,43 @@ export default function MemberList() {
       {/* Hidden file input for doc upload only (photo now uses Capacitor Camera) */}
       <input ref={docRowInputRef} type="file" className="hidden" onChange={handleDocRowFileSelected} />
 
-      <div className="flex flex-wrap gap-3 mb-5 items-center justify-between">
-        <div className="flex gap-3 flex-wrap">
-          <SearchBar value={search} onChange={(v) => { setSearch(v); setPage(1); }} placeholder="Name, phone, email…" />
-          <select
-            className="input w-36"
-            value={statusFilter}
-            onChange={(e) => { setStatusFilter(e.target.value); setPage(1); }}
-            style={{ WebkitAppearance: "none" }}
-          >
-            {STATUS_OPTS.map((o) => (
-              <option key={o.value} value={o.value} className="bg-surface-card">{o.label}</option>
-            ))}
-          </select>
+      <div className="flex flex-col gap-4 mb-5">
+        <div className="flex flex-wrap gap-3 items-center justify-between">
+          <SearchBar value={search} onChange={setSearch} placeholder="Name, phone, email…" />
+          <Button onClick={openAdd}><Plus size={15} /> Add Member</Button>
         </div>
-        <Button onClick={openAdd}><Plus size={15} /> Add Member</Button>
+
+        {/* Chip-based filters — Status / Shift / Plan. Only one chip active
+            per group; selecting "All" clears that filter. All combine
+            together with search, entirely on the frontend (see
+            `visibleMembers`) — no dropdowns, no backend filter params. */}
+        <div className="flex flex-col gap-3">
+          <FilterChips label="Status" options={STATUS_FILTER_CHIPS} value={statusFilter} onChange={setStatusFilter} />
+          <FilterChips label="Shift" options={SHIFT_FILTER_CHIPS} value={shiftFilter} onChange={setShiftFilter} />
+          <FilterChips label="Plan" options={planFilterOptions} value={planFilter} onChange={setPlanFilter} />
+
+          {/* Notice Members — single toggle chip (not a select group).
+              OFF (default) shows everyone; ON shows only members with a
+              non-empty address (Notice). Combines with all other filters. */}
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setNoticeOnly((v) => !v)}
+              aria-pressed={noticeOnly}
+              className={`shrink-0 px-3.5 py-1.5 rounded-full text-xs font-medium border whitespace-nowrap
+                transition-all duration-200 ease-out
+                ${noticeOnly
+                  ? "bg-brand-500 border-brand-500 text-white shadow-sm shadow-brand-500/30"
+                  : "bg-surface-muted border-surface-border text-gray-400 hover:text-gray-200 hover:border-brand-500/40 hover:-translate-y-0.5"}`}
+            >
+              📢 Notice Members
+            </button>
+          </div>
+        </div>
       </div>
 
       <div className="card p-0 overflow-hidden">
-        {loading ? <Spinner /> : members.length === 0 ? <EmptyState message="No members found" /> : (
+        {loading ? <Spinner /> : visibleMembers.length === 0 ? <EmptyState message="No members found" /> : (
           <>
             {/* Desktop table */}
             <div className="hidden sm:block overflow-x-auto">
@@ -753,13 +895,14 @@ export default function MemberList() {
                     <th className="table-th">Member</th>
                     <th className="table-th hidden sm:table-cell">Phone</th>
                     <th className="table-th hidden md:table-cell">Plan</th>
+                    <th className="table-th hidden lg:table-cell">Shift</th>
                     <th className="table-th hidden md:table-cell">Renewal</th>
                     <th className="table-th">Status</th>
                     <th className="table-th text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {members.map((m, index) => (
+                  {visibleMembers.map((m, index) => (
                     <tr key={m.id} className="table-row">
                       <td className="table-td text-gray-400 text-sm">{total - serialOffset - index}</td>
                       <td className="table-td">
@@ -773,6 +916,12 @@ export default function MemberList() {
                       </td>
                       <td className="table-td hidden sm:table-cell text-gray-400">{m.phone}</td>
                       <td className="table-td hidden md:table-cell text-gray-400">{m.plan?.name || "—"}</td>
+                      <td className="table-td hidden lg:table-cell">
+                        <div className="flex flex-col items-start gap-1">
+                          <ShiftBadge shift={m.shift} />
+                          <ExpiryWarningBadge renewalDate={m.renewal_date} />
+                        </div>
+                      </td>
                       <td className="table-td hidden md:table-cell">
                         {(() => {
                           const info = getRenewalInfo(m.renewal_date);
@@ -841,24 +990,46 @@ export default function MemberList() {
 
             {/* Mobile card list */}
             <div className="sm:hidden divide-y divide-surface-border">
-              {members.map((m, index) => (
+              {visibleMembers.map((m, index) => (
                 <div key={m.id} className="p-4">
                   <div className="flex items-start gap-3">
                     <MemberAvatar member={m} size={12} onClick={() => m.photo_url && setPreviewImage(m.photo_url)} />
                     <div className="flex-1 min-w-0">
+                      {/* Name + Status */}
                       <div className="flex items-center justify-between gap-2 flex-wrap">
                         <p className="font-semibold text-gray-100 text-sm">{m.name}</p>
                         <MemberStatusBadge member={m} />
                       </div>
-                      <p className="text-xs text-gray-500 mt-0.5">{m.phone}</p>
-                      <p className="text-xs text-gray-500">ID: {total - serialOffset - index}</p>
-                      {m.plan?.name && <p className="text-xs text-gray-500">{m.plan.name}</p>}
-                      {m.renewal_date && (() => {
-                        const info = getRenewalInfo(m.renewal_date);
-                        return info
-                          ? <p className={`text-xs font-medium ${info.cls}`}>{info.label}</p>
-                          : null;
-                      })()}
+
+                      {/* Phone / ID / Plan */}
+                      <p className="text-xs text-gray-500 mt-1">{m.phone}</p>
+                      <p className="text-xs text-gray-500 mt-0.5">ID: {total - serialOffset - index}</p>
+                      {m.plan?.name && <p className="text-xs text-gray-500 mt-0.5">{m.plan.name}</p>}
+
+                      {/* Shift badge + Days left + Notice */}
+                      {(m.shift || m.renewal_date || m.address) && (
+                        <div className="mt-1.5 space-y-1.5">
+                        <div className="flex items-center flex-wrap gap-2">
+                          <ShiftBadge shift={m.shift} />
+                          {m.renewal_date && (() => {
+                            const days = getDaysLeft(m.renewal_date);
+                            if (days !== null && days !== undefined && days <= 7) return null; // shown as the warning badge below instead
+                            const info = getRenewalInfo(m.renewal_date);
+                            return info
+                              ? <span className={`text-xs font-medium ${info.cls}`}>{info.label}</span>
+                              : null;
+                          })()}
+                          {m.address && (
+                            <span className="inline-flex items-center gap-1 text-xs text-yellow-400 min-w-0">
+                              <span className="shrink-0 text-[11px] leading-4">📢</span>
+                              <span className="break-words">{m.address}</span>
+                            </span>
+                          )}
+                        </div>
+                          {m.renewal_date && <ExpiryWarningBadge renewalDate={m.renewal_date} />}
+                        </div>
+                      )}
+
                       {/* Mobile action buttons */}
                       <div className="flex flex-wrap gap-2 mt-3">
                         {/* Camera photo button — opens device camera via Capacitor */}
@@ -914,7 +1085,7 @@ export default function MemberList() {
         )}
       </div>
 
-      <Pagination page={page} total={total} limit={20} onPage={setPage} />
+      <Pagination page={page} total={total} limit={PAGE_SIZE} onPage={setPage} />
 
       {/* Add/Edit Member Modal */}
       <Modal open={modal} onClose={() => setModal(false)} title={editing ? "Edit Member" : "Add Member"} width="max-w-xl">
@@ -948,6 +1119,9 @@ export default function MemberList() {
           <FormField label="Status">
             <Select options={STATUS_OPTS.slice(1)} value={form.status} onChange={set("status")} />
           </FormField>
+          <FormField label="Shift">
+            <Select options={SHIFT_OPTS} value={form.shift} onChange={set("shift")} />
+          </FormField>
           <FormField label="Join date">
             <input type="date" className="input" value={form.join_date} onChange={handleJoinDateChange} />
           </FormField>
@@ -960,7 +1134,7 @@ export default function MemberList() {
               tabIndex={-1}
             />
           </FormField>
-          <FormField label="Address" className="col-span-2">
+          <FormField label="Notice" className="col-span-2">
             <input type="text" className="input" value={form.address} onChange={set("address")} />
           </FormField>
           <div className="col-span-2 flex justify-end gap-3 pt-2">
@@ -1024,6 +1198,8 @@ export default function MemberList() {
 
       <style>{`
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .chip-scroll { scrollbar-width: none; -ms-overflow-style: none; }
+        .chip-scroll::-webkit-scrollbar { display: none; }
       `}</style>
 
       <FloatingActionMenu
@@ -1032,7 +1208,7 @@ export default function MemberList() {
         actions={[
           { label: "Add Member",     icon: UserPlus,        onClick: openAdd },
           { label: "Edit Member",    icon: Edit2,           onClick: () => {
-              if (members.length > 0) openEdit(members[0]);
+              if (visibleMembers.length > 0) openEdit(visibleMembers[0]);
               else toast.error("No members to edit");
           }},
           { label: "Export Members", icon: FileSpreadsheet, onClick: exportMembers },

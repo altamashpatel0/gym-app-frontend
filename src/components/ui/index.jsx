@@ -171,3 +171,26 @@ export function Spinner() {
     </div>
   );
 }
+
+// ── Skeleton ──────────────────────────────────────────────────────────────────
+// Generic pulsing placeholder block. Pass className to control size/shape,
+// e.g. <Skeleton className="w-16 h-16 rounded-full" /> for an avatar.
+export function Skeleton({ className = "" }) {
+  return <div className={`animate-pulse bg-surface-muted rounded-md ${className}`} />;
+}
+
+// ── ErrorState ────────────────────────────────────────────────────────────────
+// Shared "something went wrong" panel with an optional retry action, used by
+// any screen that loads data from the API and wants a consistent error UI.
+export function ErrorState({ message = "Something went wrong", onRetry }) {
+  return (
+    <div className="py-12 text-center">
+      <p className="text-sm text-red-400 mb-3">{message}</p>
+      {onRetry && (
+        <button onClick={onRetry} className="btn-secondary text-xs px-4 py-1.5">
+          Try again
+        </button>
+      )}
+    </div>
+  );
+}
