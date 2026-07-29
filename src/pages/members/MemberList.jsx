@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Camera, CameraResultType, CameraSource } from "@capacitor/camera";
-import { Plus, Edit2, Trash2, Camera as CameraIcon, Upload, FolderOpen, FileText, Loader2, X, ExternalLink, Eye, UserPlus, FileSpreadsheet, Sun, Moon } from "lucide-react";
+import { Plus, Edit2, Trash2, Camera as CameraIcon, Upload, FolderOpen, FileText, Loader2, X, ExternalLink, Eye, UserPlus, FileSpreadsheet, Sun, Moon, Pause, Play } from "lucide-react";
 import { FloatingActionMenu } from "../../components/ui/FloatingActionMenu";
 import toast from "react-hot-toast";
 import { AppLayout } from "../../components/layout/AppLayout";
@@ -49,6 +49,15 @@ const SHIFT_FILTER_CHIPS = [
 const SHIFT_OPTS = [
   { value: "Day", label: "Day" },
   { value: "Night", label: "Night" },
+];
+
+// ── Attendance Pause reason options (NOT related to Member Status) ───────────
+const ATTENDANCE_PAUSE_REASON_OPTS = [
+  { value: "", label: "Select reason" },
+  { value: "Payment Due", label: "Payment Due" },
+  { value: "Medical Leave", label: "Medical Leave" },
+  { value: "Membership Hold", label: "Membership Hold" },
+  { value: "Other", label: "Other" },
 ];
 
 const DOC_TYPE_OPTS = [
@@ -100,6 +109,17 @@ function ShiftBadge({ shift }) {
     <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium ${cfg.cls}`}>
       <Icon size={11} />
       {cfg.label}
+    </span>
+  );
+}
+
+// ── Attendance Pause badge — separate concept from Member Status ─────────────
+function AttendancePauseBadge({ paused }) {
+  if (!paused) return null;
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium bg-orange-500/15 text-orange-400 border border-orange-500/20">
+      <Pause size={11} />
+      Attendance Paused
     </span>
   );
 }
@@ -400,6 +420,48 @@ function DocumentsModal({ member, open, onClose }) {
   );
 }
 
+// ── Pause Attendance Modal ──────────────────────────────────────────────────
+// Attendance Pause is a separate feature from Member Status — this dialog
+// never touches member.status, payments, or renewal.
+function PauseAttendanceModal({ member, open, onClose, onConfirm, saving }) {
+  const [reason, setReason] = useState("");
+
+  useEffect(() => {
+    if (open) setReason("");
+  }, [open]);
+
+  const handleConfirm = () => {
+    if (!reason) {
+      toast.error("Please select a reason");
+      return;
+    }
+    onConfirm(reason);
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} title="Pause Attendance" width="max-w-sm">
+      <div className="space-y-4">
+        <p className="text-sm text-gray-400">
+          Are you sure you want to pause attendance for {member?.name || "this member"}?
+        </p>
+        <FormField label="Reason *">
+          <Select
+            options={ATTENDANCE_PAUSE_REASON_OPTS}
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+          />
+        </FormField>
+        <div className="flex justify-end gap-3 pt-1">
+          <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
+          <Button type="button" loading={saving} onClick={handleConfirm}>
+            Pause Attendance
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // ── Member View Modal ──────────────────────────────────────────────────────────
 function MemberViewModal({ member, open, onClose }) {
   const [docs, setDocs] = useState([]);
@@ -478,6 +540,17 @@ function MemberViewModal({ member, open, onClose }) {
           <Row label="Join Date" value={member.join_date ? format(new Date(member.join_date), "dd MMM yyyy") : null} />
           <Row label="Renewal Date" value={member.renewal_date ? format(new Date(member.renewal_date), "dd MMM yyyy") : null} />
           <Row label="Notice" value={member.address} />
+          {/* Attendance Pause — read-only here, separate from Member Status above */}
+          <Row label="Attendance Status" value={member.attendance_paused ? "Paused" : "Active"} />
+          {member.attendance_paused && (
+            <>
+              <Row label="Reason" value={member.attendance_pause_reason} />
+              <Row
+                label="Paused At"
+                value={member.attendance_paused_at ? format(new Date(member.attendance_paused_at), "dd MMM yyyy, hh:mm a") : null}
+              />
+            </>
+          )}
         </div>
 
         {/* Documents */}
@@ -565,6 +638,11 @@ export default function MemberList() {
 
   // View member modal
   const [viewModal, setViewModal] = useState(null);
+
+  // Attendance Pause (separate from Member Status — do not merge with deleteId etc.)
+  const [pauseTarget, setPauseTarget] = useState(null);     // member object, for the reason dialog
+  const [resumeTarget, setResumeTarget] = useState(null);   // member id, for the confirm dialog
+  const [attendanceSaving, setAttendanceSaving] = useState(false);
 
   // FAB
   const [fabOpen, setFabOpen] = useState(false);
@@ -709,6 +787,37 @@ export default function MemberList() {
       load();
     } catch {
       toast.error("Delete failed");
+    }
+  };
+
+  // ── Attendance Pause (separate feature from Member Status) ─────────────────
+  const handlePauseAttendance = async (reason) => {
+    if (!pauseTarget) return;
+    setAttendanceSaving(true);
+    try {
+      await membersAPI.pauseAttendance(pauseTarget.id, reason);
+      toast.success("Attendance paused");
+      setPauseTarget(null);
+      load();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Failed to pause attendance");
+    } finally {
+      setAttendanceSaving(false);
+    }
+  };
+
+  const handleResumeAttendance = async () => {
+    if (!resumeTarget) return;
+    setAttendanceSaving(true);
+    try {
+      await membersAPI.resumeAttendance(resumeTarget);
+      toast.success("Attendance resumed");
+      setResumeTarget(null);
+      load();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Failed to resume attendance");
+    } finally {
+      setAttendanceSaving(false);
     }
   };
 
@@ -931,7 +1040,10 @@ export default function MemberList() {
                         })()}
                       </td>
                       <td className="table-td">
-                        <MemberStatusBadge member={m} />
+                        <div className="flex flex-col items-start gap-1">
+                          <MemberStatusBadge member={m} />
+                          <AttendancePauseBadge paused={m.attendance_paused} />
+                        </div>
                       </td>
                       <td className="table-td text-right">
                         <div className="flex justify-end items-center gap-1">
@@ -970,6 +1082,24 @@ export default function MemberList() {
                           >
                             <FolderOpen size={14} />
                           </button>
+                          {/* Pause / Resume Attendance — separate from Member Status */}
+                          {m.attendance_paused ? (
+                            <button
+                              onClick={() => setResumeTarget(m.id)}
+                              className="p-1.5 rounded-md text-gray-500 hover:text-green-400 hover:bg-green-500/10 transition-colors"
+                              title="Resume Attendance"
+                            >
+                              <Play size={14} />
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => setPauseTarget(m)}
+                              className="p-1.5 rounded-md text-gray-500 hover:text-orange-400 hover:bg-orange-500/10 transition-colors"
+                              title="Pause Attendance"
+                            >
+                              <Pause size={14} />
+                            </button>
+                          )}
                           {/* Edit */}
                           <button onClick={() => openEdit(m)} className="p-1.5 rounded-md text-gray-500 hover:text-brand-400 hover:bg-brand-500/10 transition-colors">
                             <Edit2 size={14} />
@@ -998,7 +1128,10 @@ export default function MemberList() {
                       {/* Name + Status */}
                       <div className="flex items-center justify-between gap-2 flex-wrap">
                         <p className="font-semibold text-gray-100 text-sm">{m.name}</p>
-                        <MemberStatusBadge member={m} />
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <MemberStatusBadge member={m} />
+                          <AttendancePauseBadge paused={m.attendance_paused} />
+                        </div>
                       </div>
 
                       {/* Phone / ID / Plan */}
@@ -1061,6 +1194,21 @@ export default function MemberList() {
                         >
                           <FolderOpen size={11} /> View Docs
                         </button>
+                        {m.attendance_paused ? (
+                          <button
+                            onClick={() => setResumeTarget(m.id)}
+                            className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-surface-muted border border-green-500/20 text-xs text-gray-400 hover:text-green-400 hover:border-green-500/40 transition-colors"
+                          >
+                            <Play size={11} /> Resume Attendance
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => setPauseTarget(m)}
+                            className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-surface-muted border border-orange-500/20 text-xs text-gray-400 hover:text-orange-400 hover:border-orange-500/40 transition-colors"
+                          >
+                            <Pause size={11} /> Pause Attendance
+                          </button>
+                        )}
                         <button
                           onClick={() => openEdit(m)}
                           className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-surface-muted border border-surface-border text-xs text-gray-400 hover:text-brand-400 hover:border-brand-500/40 transition-colors"
@@ -1171,6 +1319,23 @@ export default function MemberList() {
         onClose={() => setDeleteId(null)}
         onConfirm={deleteMember}
         message="Delete this member? This cannot be undone."
+      />
+
+      {/* Pause Attendance — separate feature from Member Status */}
+      <PauseAttendanceModal
+        member={pauseTarget}
+        open={!!pauseTarget}
+        onClose={() => setPauseTarget(null)}
+        onConfirm={handlePauseAttendance}
+        saving={attendanceSaving}
+      />
+
+      <ConfirmDialog
+        open={!!resumeTarget}
+        onClose={() => setResumeTarget(null)}
+        onConfirm={handleResumeAttendance}
+        title="Resume Attendance"
+        message="Are you sure?"
       />
 
       {/* Photo preview modal */}

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
 import {
-  Search, LogIn, LogOut, Eye, Phone, Clock, Calendar, RefreshCw,
+  Search, LogIn, LogOut, Eye, Phone, Clock, Calendar, RefreshCw, Ban,
 } from "lucide-react";
 import toast from "react-hot-toast";
 import { format } from "date-fns";
@@ -99,6 +99,9 @@ function StatusBadge({ status }) {
 function AttendanceCard({ member, summary, actioning, onToggle, onViewInfo }) {
   const { status, totalMinutes } = summary;
   const isIn = status === "IN";
+  // Attendance Pause only ever blocks a NEW check-in. A member already
+  // checked in today (isIn) can still check out normally even if paused.
+  const isPaused = !!member.attendance_paused && !isIn;
 
   return (
     <div className="card flex flex-col gap-4">
@@ -107,8 +110,14 @@ function AttendanceCard({ member, summary, actioning, onToggle, onViewInfo }) {
         <div className="min-w-0 flex-1">
           <p className="text-sm font-semibold text-gray-100 truncate">{member.name}</p>
           <p className="text-xs text-gray-500">Member ID: {member.id}</p>
-          <div className="mt-1.5">
+          <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
             <StatusBadge status={status} />
+            {member.attendance_paused && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium bg-orange-500/15 text-orange-400 border border-orange-500/20">
+                <Ban size={11} />
+                Attendance Paused
+              </span>
+            )}
           </div>
         </div>
       </div>
@@ -120,13 +129,16 @@ function AttendanceCard({ member, summary, actioning, onToggle, onViewInfo }) {
 
       <div className="flex flex-col sm:flex-row gap-2 mt-auto">
         <Button
-          variant={isIn ? "danger" : "primary"}
+          variant={isPaused ? "secondary" : isIn ? "danger" : "primary"}
           loading={actioning}
-          onClick={() => onToggle(member, summary)}
-          className="w-full sm:flex-1 justify-center text-xs py-2"
+          disabled={isPaused}
+          onClick={() => { if (!isPaused) onToggle(member, summary); }}
+          className={`w-full sm:flex-1 justify-center text-xs py-2 ${
+            isPaused ? "!bg-gray-600 !text-gray-300 !border-gray-500/30 !cursor-not-allowed !opacity-100 pointer-events-none" : ""
+          }`}
         >
-          {isIn ? <LogOut size={14} /> : <LogIn size={14} />}
-          {isIn ? "Check Out" : "Check In"}
+          {isPaused ? <Ban size={14} /> : isIn ? <LogOut size={14} /> : <LogIn size={14} />}
+          {isPaused ? "Attendance Paused" : isIn ? "Check Out" : "Check In"}
         </Button>
         <Button
           variant="secondary"
@@ -325,6 +337,13 @@ export default function AttendancePage() {
   }, [members, search, statusFilter, getSummary]);
 
   const handleToggle = async (member, summary) => {
+    if (summary.status === "OUT" && member.attendance_paused) {
+      // New check-in blocked while paused. Checkout (the other branch below)
+      // is intentionally left untouched — already-checked-in members can
+      // still check out normally.
+      toast.error("Attendance is paused for this member.");
+      return;
+    }
     setActioningId(member.id);
     try {
       if (summary.status === "OUT") {

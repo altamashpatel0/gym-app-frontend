@@ -50,6 +50,9 @@ export const membersAPI = {
   update: (id, data) => client.put(`/api/members/${id}`, data),
   delete: (id) => client.delete(`/api/members/${id}`),
   dueMember: () => client.get("/api/members/due-members"),
+  // ── Attendance Pause (NEW) — separate from member status ─────────────────
+  pauseAttendance: (id, reason) => client.patch(`/api/members/${id}/pause-attendance`, { reason }),
+  resumeAttendance: (id) => client.patch(`/api/members/${id}/resume-attendance`),
 };
 
 // ── Plans ─────────────────────────────────────────────────────────────────────
