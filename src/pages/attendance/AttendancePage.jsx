@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
 import {
-  Search, LogIn, LogOut, Eye, Phone, Clock, Calendar, RefreshCw, Ban,
+  Search, LogIn, LogOut, Eye, Phone, Clock, Calendar, RefreshCw, Ban, Users, TrendingUp, UserCheck,
 } from "lucide-react";
 import toast from "react-hot-toast";
 import { format } from "date-fns";
@@ -9,6 +9,7 @@ import {
   Button, Modal, Select, EmptyState, Skeleton, ErrorState,
 } from "../../components/ui/index";
 import { attendanceAPI, membersAPI } from "../../api/client";
+import { MemberPhoto } from "../../components/ui/MemberPhoto";
 
 // ── Filter dropdown options ──────────────────────────────────────────────────
 const STATUS_FILTER_OPTS = [
@@ -18,6 +19,32 @@ const STATUS_FILTER_OPTS = [
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Gym timezone: Asia/Kolkata (IST, UTC+05:30, no DST). We never rely on the
+// browser's local timezone to decide which calendar day a record belongs to.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+const AVG_ATTENDANCE_DAYS = 30;
+
+// Returns "YYYY-MM-DD" for the IST calendar day that a timestamp falls on,
+// regardless of the viewer's browser timezone.
+function getISTDateKey(input) {
+  const d = new Date(input);
+  const shifted = new Date(d.getTime() + IST_OFFSET_MS);
+  const y = shifted.getUTCFullYear();
+  const m = String(shifted.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(shifted.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+// The last `n` IST calendar-day keys, oldest first, including today.
+function getLastNDayKeysIST(n) {
+  const keys = [];
+  const now = new Date();
+  for (let i = n - 1; i >= 0; i--) {
+    keys.push(getISTDateKey(new Date(now.getTime() - i * 24 * 60 * 60 * 1000)));
+  }
+  return keys;
+}
 
 // Format a minute count as "1 Hr 20 Min" / "45 Min" / "2 Hr".
 function formatDuration(totalMinutes) {
@@ -54,34 +81,6 @@ function summarizeToday(records) {
   };
 }
 
-function initialsOf(name) {
-  return name
-    ? name.split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase()
-    : "?";
-}
-
-// ── Avatar ────────────────────────────────────────────────────────────────────
-function MemberPhoto({ member, size = "card" }) {
-  const [imgError, setImgError] = useState(false);
-  const sizeCls = size === "modal" ? "w-20 h-20 text-base" : "w-16 h-16 text-sm";
-
-  if (member.photo_url && !imgError) {
-    return (
-      <img
-        src={member.photo_url}
-        alt={member.name}
-        onError={() => setImgError(true)}
-        className={`${sizeCls} rounded-full object-cover shrink-0 border border-surface-border`}
-      />
-    );
-  }
-  return (
-    <div className={`${sizeCls} rounded-full bg-brand-500/20 border border-brand-500/30 flex items-center justify-center shrink-0`}>
-      <span className="font-bold text-brand-400">{initialsOf(member.name)}</span>
-    </div>
-  );
-}
-
 // ── Status badge (IN = green, OUT = red) ─────────────────────────────────────
 function StatusBadge({ status }) {
   const cls = status === "IN"
@@ -92,6 +91,52 @@ function StatusBadge({ status }) {
       <span className={`w-1.5 h-1.5 rounded-full ${status === "IN" ? "bg-green-400" : "bg-red-400"}`} />
       {status}
     </span>
+  );
+}
+
+// ── Statistic detail row (used inside the "View Details" modal) ─────────────
+function StatCard({ icon: Icon, label, value, hint }) {
+  return (
+    <div className="flex items-center gap-3 bg-surface-muted/50 rounded-lg px-3 py-3">
+      <div className="w-9 h-9 rounded-lg bg-surface-muted flex items-center justify-center shrink-0">
+        <Icon size={16} className="text-gray-300" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="text-xs text-gray-500 truncate">{label}</p>
+        <p className="text-base font-semibold text-gray-100">{value}</p>
+        {hint && <p className="text-[10px] text-gray-600 mt-0.5 truncate">{hint}</p>}
+      </div>
+    </div>
+  );
+}
+
+// ── Statistics detail modal (opened via "View Details") ─────────────────────
+function StatsDetailModal({
+  open, onClose, todayCount, avg, avgLoading, avgError, inCount, loading,
+}) {
+  return (
+    <Modal open={open} onClose={onClose} title="Attendance Statistics" width="max-w-sm">
+      <div className="space-y-2.5">
+        <StatCard
+          icon={UserCheck}
+          label="Today's Attendance"
+          value={loading ? "…" : todayCount}
+          hint="Unique members checked in today"
+        />
+        <StatCard
+          icon={TrendingUp}
+          label={`Average Daily Attendance (last ${AVG_ATTENDANCE_DAYS} days)`}
+          value={avgLoading ? "…" : avgError ? "—" : avg.toFixed(2)}
+          hint={avgError ? "Couldn't load 30-day history" : "Unique members per day"}
+        />
+        <StatCard
+          icon={Users}
+          label="In Gym Now"
+          value={loading ? "…" : inCount}
+          hint="Currently checked in"
+        />
+      </div>
+    </Modal>
   );
 }
 
@@ -275,10 +320,42 @@ export default function AttendancePage() {
   const [statusFilter, setStatusFilter] = useState("");
   const [actioningId, setActioningId] = useState(null);
   const [infoMember, setInfoMember] = useState(null);
+  const [showStatsModal, setShowStatsModal] = useState(false);
+
+  // ── Average Daily Attendance (last 30 days) ─────────────────────────────
+  // Reuses the existing GET /api/attendance list endpoint (attendanceAPI.list)
+  // instead of a dedicated stats endpoint. See the note in the chat response
+  // about what the backend should support for this to be efficient.
+  const [historyRecords, setHistoryRecords] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyError, setHistoryError] = useState(false);
+
+  const loadHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    setHistoryError(false);
+    try {
+      const dayKeys = getLastNDayKeysIST(AVG_ATTENDANCE_DAYS);
+      const start_date = dayKeys[0];
+      const end_date = dayKeys[dayKeys.length - 1];
+      // start_date/end_date/limit are passed in case the backend supports
+      // them; the result is also filtered client-side below, so correctness
+      // doesn't depend on the backend honoring these params.
+      const { data } = await attendanceAPI.list({ start_date, end_date, limit: 10000 });
+      const all = Array.isArray(data) ? data : data.items || [];
+      setHistoryRecords(all);
+    } catch {
+      setHistoryError(true);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
     setError(false);
+    // Fires independently so the main member grid doesn't wait on it, but
+    // still runs on every Refresh click per the requirements.
+    loadHistory();
     try {
       const [membersRes, attRes] = await Promise.all([
         membersAPI.list({ status: "active", limit: 10000 }),
@@ -293,7 +370,7 @@ export default function AttendancePage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [loadHistory]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
@@ -384,6 +461,36 @@ export default function AttendancePage() {
     [members, getSummary]
   );
 
+  // FEATURE 1 — Today's Attendance: count of UNIQUE members with at least
+  // one check-in today. recordsByMember is already keyed by member id, so
+  // its size is exactly the unique-member count (repeat check-ins by the
+  // same member collapse into one map entry).
+  const todayUniqueCount = recordsByMember.size;
+
+  // FEATURE 2 — Average Daily Attendance over the last 30 days. For every
+  // day in the window, count unique members (by member id) who have a
+  // check-in that day, in Asia/Kolkata (IST) — not the browser's timezone.
+  // Then average those daily unique counts over the number of days in the
+  // window (days with zero attendance still count toward the denominator).
+  const avgDailyAttendance = useMemo(() => {
+    const dayKeys = getLastNDayKeysIST(AVG_ATTENDANCE_DAYS);
+    const keySet = new Set(dayKeys);
+    const uniqueByDay = new Map(dayKeys.map((k) => [k, new Set()]));
+
+    for (const r of historyRecords) {
+      if (!r.check_in) continue;
+      const dayKey = getISTDateKey(r.check_in);
+      if (!keySet.has(dayKey)) continue; // outside the 30-day window — ignore
+      const memberId = r.member?.id ?? r.member_id;
+      if (memberId == null) continue;
+      uniqueByDay.get(dayKey).add(memberId);
+    }
+
+    let total = 0;
+    for (const set of uniqueByDay.values()) total += set.size;
+    return total / AVG_ATTENDANCE_DAYS;
+  }, [historyRecords]);
+
   return (
     <AppLayout title="Attendance">
       <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
@@ -399,6 +506,17 @@ export default function AttendancePage() {
         >
           <RefreshCw size={13} /> Refresh
         </button>
+      </div>
+
+      <div className="mb-5">
+        <div className="flex sm:justify-end">
+          <button
+            onClick={() => setShowStatsModal(true)}
+            className="w-full sm:w-auto text-xs text-gray-400 hover:text-gray-200 border border-gray-700 rounded-md px-3 py-1.5 transition-colors"
+          >
+            View Details
+          </button>
+        </div>
       </div>
 
       <div className="flex flex-col sm:flex-row gap-3 mb-5">
@@ -454,6 +572,17 @@ export default function AttendancePage() {
         member={infoMember}
         summary={infoMember ? getSummary(infoMember.id) : { status: "OUT", totalMinutes: 0 }}
         onClose={() => setInfoMember(null)}
+      />
+
+      <StatsDetailModal
+        open={showStatsModal}
+        onClose={() => setShowStatsModal(false)}
+        todayCount={todayUniqueCount}
+        avg={avgDailyAttendance}
+        avgLoading={historyLoading}
+        avgError={historyError}
+        inCount={inCount}
+        loading={loading}
       />
     </AppLayout>
   );

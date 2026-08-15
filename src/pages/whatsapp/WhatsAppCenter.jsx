@@ -6,6 +6,7 @@ import { ExpiringMemberCard } from "../../components/whatsapp/ExpiringMemberCard
 import { SendWhatsAppModal } from "../../components/whatsapp/SendWhatsAppModal";
 import { membersAPI } from "../../api/client";
 import { filterExpiringMembers } from "../../utils/whatsapp";
+import { MemberPhoto } from "../../components/ui/MemberPhoto";
 
 export default function WhatsAppCenter() {
   const [members, setMembers] = useState([]);
@@ -108,12 +109,16 @@ export default function WhatsAppCenter() {
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             {expiringMembers.map((m) => (
-              <ExpiringMemberCard
-                key={m.id}
-                member={m}
-                checked={selected.has(m.id)}
-                onToggle={toggleMember}
-              />
+              <div key={m.id} className="flex items-center gap-3">
+                <MemberPhoto member={m} />
+                <div className="min-w-0 flex-1">
+                  <ExpiringMemberCard
+                    member={m}
+                    checked={selected.has(m.id)}
+                    onToggle={toggleMember}
+                  />
+                </div>
+              </div>
             ))}
           </div>
         )}

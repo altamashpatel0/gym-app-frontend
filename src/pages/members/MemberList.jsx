@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Camera, CameraResultType, CameraSource } from "@capacitor/camera";
-import { Plus, Edit2, Trash2, Camera as CameraIcon, Upload, FolderOpen, FileText, Loader2, X, ExternalLink, Eye, UserPlus, FileSpreadsheet, Sun, Moon, Pause, Play } from "lucide-react";
+import { Plus, Edit2, Trash2, Camera as CameraIcon, Upload, FolderOpen, FileText, Loader2, X, ExternalLink, Eye, UserPlus, FileSpreadsheet, Sun, Moon, Pause, Play, CreditCard, RefreshCw } from "lucide-react";
 import { FloatingActionMenu } from "../../components/ui/FloatingActionMenu";
 import toast from "react-hot-toast";
 import { AppLayout } from "../../components/layout/AppLayout";
@@ -8,11 +8,19 @@ import {
   Button, Badge, Modal, SearchBar, Pagination,
   ConfirmDialog, FormField, Select, EmptyState, Spinner
 } from "../../components/ui/index";
-import { membersAPI, plansAPI, mediaAPI } from "../../api/client";
-import { format } from "date-fns";
+import { membersAPI, plansAPI, mediaAPI, paymentsAPI } from "../../api/client";
+import { format, differenceInCalendarDays } from "date-fns";
 import useAuthStore from "../../store/authStore";
 import { exportToExcel } from "../../utils/exportExcel";
 import { calcRenewalDate, getRenewalInfo, getMemberStatus, getDaysLeft } from "../../utils/renewal";
+import { saveMemberPhoto, getMemberPhoto, onMemberPhotoChange } from "../../utils/memberPhotoStorage";
+
+const MODE_OPTS = [
+  { value: "cash", label: "Cash" },
+  { value: "upi", label: "UPI" },
+  { value: "card", label: "Card" },
+  { value: "bank", label: "Bank Transfer" },
+];
 
 const STATUS_OPTS = [
   { value: "", label: "All Status" },
@@ -35,7 +43,8 @@ const GENDER_OPTS = [
 const STATUS_FILTER_CHIPS = [
   { value: "", label: "All" },
   { value: "active", label: "Active" },
-  { value: "expiring_soon", label: "7 Days Expiring" },
+  { value: "expiring_soon", label: "Expiring Soon" },
+  { value: "expired", label: "Expired" },
   { value: "paused", label: "Paused" },
 ];
 
@@ -87,6 +96,28 @@ const STATUS_BADGE = {
 
 function MemberStatusBadge({ member }) {
   const status = getMemberStatus(member);
+
+  // Expired members get a more informative badge than the plain "Expired"
+  // pill — a clear red "Membership Expired" label plus how many days ago
+  // it lapsed, computed from the existing renewal_date (no new data needed).
+  if (status === "expired") {
+    const daysAgo = member.renewal_date
+      ? Math.max(0, differenceInCalendarDays(new Date(), new Date(member.renewal_date)))
+      : null;
+    return (
+      <div className="flex flex-col items-start gap-0.5">
+        <span className="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-semibold bg-red-500/15 text-red-400 border border-red-500/20">
+          Membership Expired
+        </span>
+        {daysAgo !== null && (
+          <span className="text-[11px] text-red-400/80">
+            Expired {daysAgo} day{daysAgo === 1 ? "" : "s"} ago
+          </span>
+        )}
+      </div>
+    );
+  }
+
   const cfg = STATUS_BADGE[status] || STATUS_BADGE.active;
   return (
     <span className={`inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium ${cfg.cls}`}>
@@ -147,7 +178,7 @@ function ExpiryWarningBadge({ renewalDate }) {
 // Modern chip-based filter row: rounded pill buttons, single-select per group.
 // Selecting "All" (value === "") clears that filter. Horizontally scrollable
 // on overflow (mobile-first) with hidden scrollbar via .chip-scroll below.
-function FilterChips({ label, options, value, onChange }) {
+function FilterChips({ label, options, value, onChange, counts }) {
   if (!options || options.length <= 1) return null; // nothing to filter by yet (e.g. no plans loaded)
   return (
     <div className="min-w-0">
@@ -155,6 +186,7 @@ function FilterChips({ label, options, value, onChange }) {
       <div className="chip-scroll flex gap-2 overflow-x-auto pb-1 -mx-0.5 px-0.5">
         {options.map((opt) => {
           const active = opt.value === value;
+          const count = counts ? counts[opt.value] : undefined;
           return (
             <button
               key={opt.value || `${label}-all`}
@@ -166,7 +198,7 @@ function FilterChips({ label, options, value, onChange }) {
                   ? "bg-brand-500 border-brand-500 text-white shadow-sm shadow-brand-500/30"
                   : "bg-surface-muted border-surface-border text-gray-400 hover:text-gray-200 hover:border-brand-500/40 hover:-translate-y-0.5"}`}
             >
-              {opt.label}
+              {opt.label}{count !== undefined ? ` (${count})` : ""}
             </button>
           );
         })}
@@ -176,18 +208,49 @@ function FilterChips({ label, options, value, onChange }) {
 }
 
 // ── Avatar ─────────────────────────────────────────────────────────────────────
+// Reads the member's photo from local Capacitor Filesystem storage (Phase 1:
+// no more B2/Cloudinary photo_url). onClick receives the local data URL so
+// the caller can show it in the preview modal — works fully offline.
 function MemberAvatar({ member, size = 8, onClick }) {
   const [imgError, setImgError] = useState(false);
+  const [localPhoto, setLocalPhoto] = useState(null);
+  const memberId = member?.id;
+
   const initials = member.name
     ? member.name.split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase()
     : "?";
 
-  if (member.photo_url && !imgError) {
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadPhoto() {
+      setImgError(false);
+      if (!memberId) {
+        setLocalPhoto(null);
+        return;
+      }
+      const photo = await getMemberPhoto(memberId);
+      if (!cancelled) setLocalPhoto(photo);
+    }
+
+    loadPhoto();
+
+    const unsubscribe = onMemberPhotoChange((changedId) => {
+      if (!cancelled && changedId === String(memberId)) loadPhoto();
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [memberId]);
+
+  if (localPhoto && !imgError) {
     return (
       <img
-        src={member.photo_url}
+        src={localPhoto}
         alt={member.name}
-        onClick={onClick}
+        onClick={() => onClick?.(localPhoto)}
         className={`w-${size} h-${size} rounded-full object-cover shrink-0 border border-surface-border cursor-pointer transition-transform duration-150 hover:scale-110`}
         onError={() => setImgError(true)}
       />
@@ -467,6 +530,33 @@ function MemberViewModal({ member, open, onClose }) {
   const [docs, setDocs] = useState([]);
   const [loadingDocs, setLoadingDocs] = useState(false);
   const [imgError, setImgError] = useState(false);
+  const [localPhoto, setLocalPhoto] = useState(null);
+  const memberId = member?.id;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadPhoto() {
+      setImgError(false);
+      if (!memberId) {
+        setLocalPhoto(null);
+        return;
+      }
+      const photo = await getMemberPhoto(memberId);
+      if (!cancelled) setLocalPhoto(photo);
+    }
+
+    loadPhoto();
+
+    const unsubscribe = onMemberPhotoChange((changedId) => {
+      if (!cancelled && changedId === String(memberId)) loadPhoto();
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [memberId]);
 
   const initials = member?.name
     ? member.name.split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase()
@@ -508,9 +598,9 @@ function MemberViewModal({ member, open, onClose }) {
       <div className="space-y-5">
         {/* Photo + name header */}
         <div className="flex items-center gap-4">
-          {member.photo_url && !imgError ? (
+          {localPhoto && !imgError ? (
             <img
-              src={member.photo_url}
+              src={localPhoto}
               alt={member.name}
               className="w-20 h-20 rounded-full object-cover border-2 border-brand-500/40 shrink-0"
               onError={() => setImgError(true)}
@@ -647,6 +737,15 @@ export default function MemberList() {
   // FAB
   const [fabOpen, setFabOpen] = useState(false);
 
+  // Collect Payment — expired-member quick action. Uses the same existing
+  // paymentsAPI.collect() the Payments page already calls; no new endpoint.
+  const [collectTarget, setCollectTarget] = useState(null);
+  const [collectForm, setCollectForm] = useState({
+    plan_id: "", amount: "", payment_mode: "cash", note: "",
+    valid_from: format(new Date(), "yyyy-MM-dd"), valid_to: "",
+  });
+  const [collectSaving, setCollectSaving] = useState(false);
+
   useEffect(() => {
     if (!previewImage) return;
     const onKey = (e) => { if (e.key === "Escape") setPreviewImage(null); };
@@ -688,6 +787,18 @@ export default function MemberList() {
     { value: "", label: "All" },
     ...plans.map((p) => ({ value: p.name, label: p.name })),
   ]), [plans]);
+
+  // Counts for the Status quick-filter chips (All/Active/Expiring Soon/
+  // Expired/Paused) — computed purely on the frontend from the already
+  // loaded full member list, independent of any other active filter.
+  const statusCounts = useMemo(() => {
+    const counts = { "": members.length, active: 0, expiring_soon: 0, expired: 0, paused: 0 };
+    for (const m of members) {
+      const s = getMemberStatus(m);
+      if (counts[s] !== undefined) counts[s] += 1;
+    }
+    return counts;
+  }, [members]);
 
   // ── Filtering pipeline: Load Members → Search → Status → Shift → Plan ──────
   // Runs over the COMPLETE member list (not just one page), so a filter can
@@ -790,6 +901,62 @@ export default function MemberList() {
     }
   };
 
+  // ── Collect Payment (expired-member quick action) ───────────────────────
+  // Reuses the existing paymentsAPI.collect() call the Payments page already
+  // uses — no new backend endpoint, no change to payment/collection logic.
+  const openCollectPayment = (m) => {
+    const planId = m.plan_id ?? m.plan?.id ?? "";
+    const plan = plans.find((p) => String(p.id) === String(planId));
+    const from = format(new Date(), "yyyy-MM-dd");
+    setCollectForm({
+      plan_id: planId,
+      amount: plan?.price ?? "",
+      payment_mode: "cash",
+      note: "",
+      valid_from: from,
+      valid_to: plan ? calcRenewalDate(from, plan.duration_months) : "",
+    });
+    setCollectTarget(m);
+  };
+
+  const setCollectField = (k) => (e) => {
+    const updated = { ...collectForm, [k]: e.target.value };
+    if (k === "plan_id" && e.target.value) {
+      const plan = plans.find((p) => String(p.id) === String(e.target.value));
+      if (plan) {
+        const from = updated.valid_from || format(new Date(), "yyyy-MM-dd");
+        updated.amount = plan.price;
+        updated.valid_to = calcRenewalDate(from, plan.duration_months);
+      }
+    }
+    setCollectForm(updated);
+  };
+
+  const submitCollectPayment = async (e) => {
+    e.preventDefault();
+    if (!collectTarget) return;
+    setCollectSaving(true);
+    try {
+      const payload = {
+        member_id: collectTarget.id,
+        amount: parseFloat(collectForm.amount),
+        payment_mode: collectForm.payment_mode,
+        note: collectForm.note,
+      };
+      if (collectForm.plan_id) payload.plan_id = parseInt(collectForm.plan_id);
+      if (collectForm.valid_from) payload.valid_from = collectForm.valid_from;
+      if (collectForm.valid_to) payload.valid_to = collectForm.valid_to;
+      await paymentsAPI.collect(payload);
+      toast.success("Payment collected — membership renewed!");
+      setCollectTarget(null);
+      load(); // refresh members so status/renewal reflect the new payment
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Error collecting payment");
+    } finally {
+      setCollectSaving(false);
+    }
+  };
+
   // ── Attendance Pause (separate feature from Member Status) ─────────────────
   const handlePauseAttendance = async (reason) => {
     if (!pauseTarget) return;
@@ -821,39 +988,34 @@ export default function MemberList() {
     }
   };
 
-  // ── Camera / Photo upload (Capacitor) ─────────────────────────────────────
+  // ── Camera / Photo (local device storage only — Phase 1) ──────────────────
+  // No backend/B2/Cloudinary upload. The photo is written straight to
+  // Capacitor Filesystem as member-photos/{memberId}.jpg and every mounted
+  // MemberAvatar/MemberPhoto for this member updates itself via
+  // onMemberPhotoChange — no need to refetch members from the server.
   const takePhoto = async (member) => {
     const memberId = member.id;
     setPhotoUploading(memberId);
 
     try {
-      const permissions = await Camera.requestPermissions({
+      await Camera.requestPermissions({
         permissions: ["camera", "photos"]
       });
-
-      console.log("Permissions:", permissions);
 
       const image = await Camera.getPhoto({
         quality: 90,
         allowEditing: false,
-        resultType: CameraResultType.Uri,
+        resultType: CameraResultType.Base64,
         source: CameraSource.Camera,
       });
 
-      const response = await fetch(image.webPath);
-      const blob = await response.blob();
+      const saved = await saveMemberPhoto(memberId, image.base64String);
 
-      const file = new File(
-        [blob],
-        `photo_${memberId}.jpg`,
-        { type: blob.type || "image/jpeg" }
-      );
-
-      await mediaAPI.uploadPhoto(memberId, file);
+      if (!saved) {
+        throw new Error("Could not save photo on this device");
+      }
 
       toast.success("Photo updated!");
-      load();
-
     } catch (err) {
       console.error("Camera error:", err);
       toast.error(err?.message || "Camera failed");
@@ -968,7 +1130,7 @@ export default function MemberList() {
             together with search, entirely on the frontend (see
             `visibleMembers`) — no dropdowns, no backend filter params. */}
         <div className="flex flex-col gap-3">
-          <FilterChips label="Status" options={STATUS_FILTER_CHIPS} value={statusFilter} onChange={setStatusFilter} />
+          <FilterChips label="Status" options={STATUS_FILTER_CHIPS} value={statusFilter} onChange={setStatusFilter} counts={statusCounts} />
           <FilterChips label="Shift" options={SHIFT_FILTER_CHIPS} value={shiftFilter} onChange={setShiftFilter} />
           <FilterChips label="Plan" options={planFilterOptions} value={planFilter} onChange={setPlanFilter} />
 
@@ -1016,7 +1178,7 @@ export default function MemberList() {
                       <td className="table-td text-gray-400 text-sm">{total - serialOffset - index}</td>
                       <td className="table-td">
                         <div className="flex items-center gap-3">
-                          <MemberAvatar member={m} size={8} onClick={() => m.photo_url && setPreviewImage(m.photo_url)} />
+                          <MemberAvatar member={m} size={8} onClick={(photo) => photo && setPreviewImage(photo)} />
                           <div>
                             <p className="font-medium text-gray-100">{m.name}</p>
                             <p className="text-xs text-gray-500 sm:hidden">{m.phone}</p>
@@ -1047,6 +1209,26 @@ export default function MemberList() {
                       </td>
                       <td className="table-td text-right">
                         <div className="flex justify-end items-center gap-1">
+                          {/* Expired-member quick actions — Collect Payment / Renew Membership.
+                              "View Info" is the existing Eye button below, reused as-is. */}
+                          {getMemberStatus(m) === "expired" && (
+                            <>
+                              <button
+                                onClick={() => openCollectPayment(m)}
+                                className="p-1.5 rounded-md text-gray-500 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                                title="Collect Payment"
+                              >
+                                <CreditCard size={14} />
+                              </button>
+                              <button
+                                onClick={() => openEdit(m)}
+                                className="p-1.5 rounded-md text-gray-500 hover:text-brand-400 hover:bg-brand-500/10 transition-colors"
+                                title="Renew Membership"
+                              >
+                                <RefreshCw size={14} />
+                              </button>
+                            </>
+                          )}
                           {/* Camera photo button — opens device camera via Capacitor */}
                           <button
                             onClick={() => takePhoto(m)}
@@ -1070,7 +1252,7 @@ export default function MemberList() {
                           <button
                             onClick={() => setViewModal(m)}
                             className="p-1.5 rounded-md text-gray-500 hover:text-brand-400 hover:bg-brand-500/10 transition-colors"
-                            title="View Member"
+                            title="View Info"
                           >
                             <Eye size={14} />
                           </button>
@@ -1123,7 +1305,7 @@ export default function MemberList() {
               {visibleMembers.map((m, index) => (
                 <div key={m.id} className="p-4">
                   <div className="flex items-start gap-3">
-                    <MemberAvatar member={m} size={12} onClick={() => m.photo_url && setPreviewImage(m.photo_url)} />
+                    <MemberAvatar member={m} size={12} onClick={(photo) => photo && setPreviewImage(photo)} />
                     <div className="flex-1 min-w-0">
                       {/* Name + Status */}
                       <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -1165,6 +1347,23 @@ export default function MemberList() {
 
                       {/* Mobile action buttons */}
                       <div className="flex flex-wrap gap-2 mt-3">
+                        {/* Expired-member quick actions — Collect Payment / Renew Membership */}
+                        {getMemberStatus(m) === "expired" && (
+                          <>
+                            <button
+                              onClick={() => openCollectPayment(m)}
+                              className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-red-500/15 border border-red-500/30 text-xs font-medium text-red-400 hover:bg-red-500/25 transition-colors"
+                            >
+                              <CreditCard size={11} /> Collect Payment
+                            </button>
+                            <button
+                              onClick={() => openEdit(m)}
+                              className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-brand-500/15 border border-brand-500/30 text-xs font-medium text-brand-400 hover:bg-brand-500/25 transition-colors"
+                            >
+                              <RefreshCw size={11} /> Renew Membership
+                            </button>
+                          </>
+                        )}
                         {/* Camera photo button — opens device camera via Capacitor */}
                         <button
                           onClick={() => takePhoto(m)}
@@ -1186,7 +1385,7 @@ export default function MemberList() {
                           onClick={() => setViewModal(m)}
                           className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-surface-muted border border-surface-border text-xs text-gray-400 hover:text-brand-400 hover:border-brand-500/40 transition-colors"
                         >
-                          <Eye size={11} /> View
+                          <Eye size={11} /> View Info
                         </button>
                         <button
                           onClick={() => setDocsModal(m)}
@@ -1305,6 +1504,52 @@ export default function MemberList() {
         open={!!viewModal}
         onClose={() => setViewModal(null)}
       />
+
+      {/* Collect Payment Modal — expired-member quick action. Calls the same
+          existing paymentsAPI.collect() the Payments page uses; no new
+          endpoint, no change to payment/collection logic. */}
+      <Modal
+        open={!!collectTarget}
+        onClose={() => setCollectTarget(null)}
+        title={`Collect Payment${collectTarget ? ` — ${collectTarget.name}` : ""}`}
+        width="max-w-md"
+      >
+        <form onSubmit={submitCollectPayment} className="space-y-4">
+          <FormField label="Plan">
+            <Select options={planOpts} value={collectForm.plan_id} onChange={setCollectField("plan_id")} />
+          </FormField>
+          <div className="grid grid-cols-2 gap-4">
+            <FormField label="Amount (₹) *">
+              <input
+                type="number"
+                required
+                className="input"
+                value={collectForm.amount}
+                onChange={setCollectField("amount")}
+                min="1"
+              />
+            </FormField>
+            <FormField label="Payment mode">
+              <Select options={MODE_OPTS} value={collectForm.payment_mode} onChange={setCollectField("payment_mode")} />
+            </FormField>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <FormField label="Valid from">
+              <input type="date" className="input" value={collectForm.valid_from} onChange={setCollectField("valid_from")} />
+            </FormField>
+            <FormField label="Valid to">
+              <input type="date" className="input" value={collectForm.valid_to} onChange={setCollectField("valid_to")} />
+            </FormField>
+          </div>
+          <FormField label="Note">
+            <input type="text" className="input" value={collectForm.note} onChange={setCollectField("note")} placeholder="Optional" />
+          </FormField>
+          <div className="flex justify-end gap-3 pt-2">
+            <Button type="button" variant="secondary" onClick={() => setCollectTarget(null)}>Cancel</Button>
+            <Button type="submit" loading={collectSaving}>Collect Payment</Button>
+          </div>
+        </form>
+      </Modal>
 
       {/* Row-level doc upload meta modal */}
       <DocMetaModal

@@ -16,6 +16,7 @@ import StaffList from "./pages/staff/StaffList";
 import Reports from "./pages/reports/Reports";
 import Notifications from "./pages/notifications/Notifications";
 import WhatsAppCenter from "./pages/whatsapp/WhatsAppCenter";
+import PhotoSync from "./pages/photo-sync/PhotoSync";
 
 function AuthGate({ children }) {
   const { token, hydrated, setAuth, logout, setHydrated } = useAuthStore();
@@ -78,6 +79,14 @@ export default function App() {
           <Route path="/attendance"    element={<PrivateRoute><AttendancePage /></PrivateRoute>} />
           <Route path="/notifications" element={<PrivateRoute><Notifications /></PrivateRoute>} />
           <Route path="/whatsapp"      element={<PrivateRoute><WhatsAppCenter /></PrivateRoute>} />
+          <Route
+            path="/photo-sync"
+            element={
+              <PrivateRoute>
+                <PhotoSync />
+              </PrivateRoute>
+            }
+          />
           <Route path="/staff"         element={<PrivateRoute roles={["owner","admin"]}><StaffList /></PrivateRoute>} />
           <Route path="/reports"       element={<PrivateRoute roles={["owner","admin"]}><Reports /></PrivateRoute>} />
 
