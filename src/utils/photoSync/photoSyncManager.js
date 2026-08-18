@@ -10,11 +10,38 @@ import {
   getPhotoMetadata,
   getConflictDetails,
 } from "../memberPhotoIndex";
-import { registerSyncedPhoto } from "../memberPhotoStorage";
+import {
+  registerSyncedPhoto,
+  migrateLegacyPhotosToIndex,
+} from "../memberPhotoStorage";
 
 const LocalLanSync = registerPlugin("LocalLanSync");
 
 const DEVICE_KEY = "gymops_sync_device_identity_v1";
+
+// Structured, Logcat-safe logging — matches the pattern used in
+// memberPhotoStorage.js/memberPhotoIndex.js. Passing a raw object as the
+// second console.error() arg renders as "[object Object]" on Android; a
+// stringified payload shows the real errorMessage/errorCode/stack.
+function logSyncFailure(operation, details, error) {
+  const payload = {
+    ...details,
+    errorMessage:
+      error?.message ?? (error !== undefined ? String(error) : undefined),
+    errorCode: error?.code ?? error?.errorCode ?? undefined,
+    nativeError: error?.data ?? error?.nativeError ?? undefined,
+    stack: error?.stack,
+  };
+
+  try {
+    console.error(
+      `[photoSyncManager] ${operation}`,
+      JSON.stringify(payload, null, 2)
+    );
+  } catch {
+    console.error(`[photoSyncManager] ${operation}`, payload);
+  }
+}
 
 function randomId() {
   if (globalThis.crypto?.randomUUID) {
@@ -97,11 +124,47 @@ export async function disconnect() {
 }
 
 export async function exchangePhotoIndex() {
+  // Rebuild the index for any legacy (pre-Phase-2) photos on this device
+  // BEFORE computing what to send. migrateLegacyPhotosToIndex() is itself
+  // resilient — a single unreadable/unhashable legacy file is logged and
+  // skipped internally without throwing (see memberPhotoStorage.js) — so a
+  // throw here means something more fundamental went wrong (e.g. the
+  // Filesystem batch write itself failed). In that case we must NOT fall
+  // through to sending whatever index happens to exist on disk: that index
+  // could be missing legacy photos this device actually has, which is
+  // exactly the "To Send: 0 / To Receive: 0" symptom this fix addresses.
+  // So: log the full structured error and abort the sync rather than
+  // silently exchanging a stale/incomplete index. Nothing is deleted and
+  // no photo file is touched either way — this only ever affects whether
+  // sendIndex() is called this round.
+  try {
+    await migrateLegacyPhotosToIndex();
+  } catch (error) {
+    logSyncFailure(
+      "exchangePhotoIndex: legacy photo migration failed — aborting index exchange rather than sending a stale/incomplete index",
+      {},
+      error
+    );
+    throw new Error(
+      "Photo index migration failed before sync; index exchange was aborted to avoid sending an incomplete index. " +
+        (error?.message || String(error))
+    );
+  }
+
   const index = await getPhotoIndex();
 
-  await LocalLanSync.sendIndex({
-    index,
-  });
+  try {
+    await LocalLanSync.sendIndex({
+      index,
+    });
+  } catch (error) {
+    logSyncFailure(
+      "exchangePhotoIndex: sendIndex failed",
+      { photoCount: Object.keys(index?.photos || {}).length },
+      error
+    );
+    throw error;
+  }
 
   return index;
 }

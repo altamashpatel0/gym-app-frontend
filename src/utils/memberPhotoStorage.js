@@ -30,9 +30,11 @@
 
 import { Filesystem, Directory } from "@capacitor/filesystem";
 import {
+  getPhotoIndex,
   getPhotoMetadata,
   updatePhotoMetadata,
   removePhotoMetadata,
+  upsertManyPhotoMetadata,
 } from "./memberPhotoIndex";
 
 const PHOTO_DIR = "member-photos";
@@ -40,6 +42,41 @@ const STORAGE_DIRECTORY = Directory.Data;
 
 const photoCache = new Map();
 const listeners = new Set();
+
+// PHASE 4A — in-flight request dedup + stale-read race protection.
+//
+// photoLoadPromises: memberId -> Promise<dataUrl|null> for a read that is
+// currently in progress. Concurrent getMemberPhoto() calls for the same
+// member all await this same Promise instead of each issuing their own
+// Filesystem.readFile(). Cleared as soon as the read settles — a Promise is
+// never kept around after it resolves/rejects.
+//
+// photoGeneration: memberId -> integer, bumped every time the on-disk photo
+// changes from JS's point of view (save, delete, or a synced photo being
+// registered). A read captures the generation it started at; when it
+// finishes, it only writes to photoCache if the generation is still the
+// same. This is what prevents a slow read that started BEFORE a save from
+// clobbering the cache with stale data AFTER the save completes.
+const photoLoadPromises = new Map();
+const photoGeneration = new Map();
+
+function bumpGeneration(key) {
+  photoGeneration.set(key, (photoGeneration.get(key) || 0) + 1);
+}
+
+/**
+ * Invalidate everything the in-flight-dedup layer knows about a member:
+ * drop the resolved-value cache entry, drop any in-flight Promise (so the
+ * next getMemberPhoto() call starts a fresh read against the new file
+ * rather than reusing a Promise that was already in progress against the
+ * old one), and bump the generation token so any still-pending read from
+ * before this call can detect it's stale and refuse to overwrite the cache.
+ */
+function invalidatePhotoCache(key) {
+  photoCache.delete(key);
+  photoLoadPromises.delete(key);
+  bumpGeneration(key);
+}
 
 function notify(memberId) {
   const key = String(memberId);
@@ -65,13 +102,25 @@ function pathFor(memberId) {
 // Structured error logger per CRITICAL TASK 3 — dev/Logcat gets full detail,
 // the UI still only ever sees the generic "Could not save photo" message.
 function logSaveFailure(operation, details, error) {
-  console.error(`[memberPhotoStorage] ${operation}`, {
+  const payload = {
     ...details,
-    errorMessage: error?.message ?? String(error),
+    errorMessage:
+      error?.message ?? (error !== undefined ? String(error) : undefined),
     errorCode: error?.code ?? error?.errorCode ?? undefined,
     nativeError: error?.data ?? error?.nativeError ?? undefined,
     stack: error?.stack,
-  });
+  };
+
+  // console.error(op, someObject) renders as "[object Object]" on Android
+  // Logcat's console bridge — JSON.stringify it so the real error surfaces.
+  try {
+    console.error(
+      `[memberPhotoStorage] ${operation}`,
+      JSON.stringify(payload, null, 2)
+    );
+  } catch {
+    console.error(`[memberPhotoStorage] ${operation}`, payload);
+  }
 }
 
 async function ensureDir(memberId) {
@@ -288,7 +337,7 @@ export async function saveMemberPhoto(memberId, base64Data) {
   }
 
   // ── Steps 5–6: update cache + notify — the photo IS saved at this point ─
-  photoCache.delete(key);
+  invalidatePhotoCache(key);
   notify(key);
 
   // ── Phase 2 bookkeeping — best-effort, never flips the result to false ─
@@ -326,7 +375,7 @@ export async function registerSyncedPhoto(memberId, remoteMetadata) {
 
   const key = String(memberId);
 
-  photoCache.delete(key);
+  invalidatePhotoCache(key);
 
   try {
     await updatePhotoMetadata({
@@ -349,35 +398,380 @@ export async function registerSyncedPhoto(memberId, remoteMetadata) {
   return true;
 }
 
+// =============================================================
+// LEGACY PHOTO MIGRATION / INDEX REBUILD
+//
+// Photos saved by the very first (pre-Phase-2) build of this app were
+// written straight to member-photos/{memberId}.jpg with no corresponding
+// entry in photo-index/index.json (that index didn't exist yet). Those
+// photo FILES are still perfectly valid and still display correctly via
+// getMemberPhoto() — the only thing missing is metadata. Because
+// photoSyncManager.js (Phase 3) builds its sync plan entirely from the
+// metadata index, those legacy photos were invisible to sync: they never
+// appeared in toSend/toReceive/conflicts even though the files exist on
+// disk.
+//
+// migrateLegacyPhotosToIndex() closes that gap by scanning the actual
+// member-photos/ directory and creating an index entry for any
+// {memberId}.jpg file that doesn't already have one. It NEVER reads,
+// writes, moves, renames or deletes an existing photo file, and it NEVER
+// touches metadata that already exists for a memberId.
+// =============================================================
+
+// Matches "<memberId>.jpg" (case-insensitive extension), where memberId is
+// one or more characters that aren't a path separator or dot. This
+// intentionally excludes dotfiles (e.g. ".nomedia") and anything that
+// isn't a plain "<id>.jpg" entry.
+const LEGACY_PHOTO_FILENAME_RE = /^([^./\\][^/\\]*)\.jpg$/i;
+
+function logMigrationWarning(operation, details, error) {
+  const payload = {
+    ...details,
+    errorMessage:
+      error?.message ?? (error !== undefined ? String(error) : undefined),
+    errorCode: error?.code ?? error?.errorCode ?? undefined,
+    nativeError: error?.data ?? error?.nativeError ?? undefined,
+    stack: error?.stack,
+  };
+
+  // Passing a raw object as the second console.warn() arg prints as
+  // "[object Object]" on Android Logcat's console bridge — stringify it so
+  // the actual errorMessage/errorCode/nativeError/stack are visible.
+  try {
+    console.warn(
+      `[memberPhotoStorage] migrateLegacyPhotosToIndex: ${operation}`,
+      JSON.stringify(payload, null, 2)
+    );
+  } catch {
+    console.warn(
+      `[memberPhotoStorage] migrateLegacyPhotosToIndex: ${operation}`,
+      payload
+    );
+  }
+}
+
+/**
+ * List the raw entries in member-photos/. Returns [] (never throws) if the
+ * directory doesn't exist yet or can't be read — that just means there is
+ * nothing to migrate.
+ *
+ * Handles both shapes returned by different Capacitor Filesystem versions:
+ * an array of plain filename strings, or an array of { name, type, ... }
+ * FileInfo objects.
+ */
+async function listMemberPhotoDirEntries() {
+  try {
+    const result = await Filesystem.readdir({
+      path: PHOTO_DIR,
+      directory: STORAGE_DIRECTORY,
+    });
+
+    const files = result?.files || [];
+
+    return files
+      .map((entry) => (typeof entry === "string" ? entry : entry?.name))
+      .filter((name) => typeof name === "string" && name.length > 0);
+  } catch (error) {
+    // Directory not existing yet (fresh install, or every photo has
+    // already been deleted) is expected and not an error worth logging.
+    const message = String(error?.message || "").toLowerCase();
+    const notFound =
+      message.includes("not exist") ||
+      message.includes("not found") ||
+      error?.code === "OS-PLUG-FILE-0009" ||
+      error?.code === "ENOENT";
+
+    if (!notFound) {
+      logMigrationWarning(
+        "could not list member-photos directory (continuing with zero legacy photos)",
+        { directory: STORAGE_DIRECTORY, path: PHOTO_DIR },
+        error
+      );
+    }
+
+    return [];
+  }
+}
+
+// Only one migration pass runs at a time. If migrateLegacyPhotosToIndex()
+// is called again while a pass is still in flight (e.g. exchangePhotoIndex()
+// firing twice in quick succession from a retried connect), the second
+// caller just awaits the SAME in-flight promise instead of starting a second
+// overlapping scan. This is what used to let two migration passes race each
+// other's index reads/writes — on Android that could throw a native
+// "file busy" style error out of Filesystem.writeFile(), which is what
+// migrateLegacyPhotosToIndex's old outer catch was actually seeing as
+// "unexpected error migrating legacy photo" for many photos in a row.
+let migrationInFlight = null;
+
+/**
+ * Scan member-photos/ for legacy {memberId}.jpg files that have no
+ * corresponding entry in photo-index/index.json, and create metadata for
+ * them (version 1). Existing metadata is never modified, and photo files
+ * are only ever read — never written, moved, renamed or deleted.
+ *
+ * Idempotent: running this multiple times in a row only creates metadata
+ * for the first run; every subsequent run finds metadata already present
+ * for those members and does nothing further for them.
+ *
+ * Safe to call with zero photos on disk, safe to call repeatedly, and
+ * best-effort per file — one corrupt/unreadable legacy photo is logged and
+ * skipped without stopping migration of the rest.
+ *
+ * Returns a summary (useful for logging/debugging); callers that just want
+ * "the index is now as complete as possible" can ignore the return value.
+ */
+export async function migrateLegacyPhotosToIndex() {
+  if (migrationInFlight) {
+    return migrationInFlight;
+  }
+
+  migrationInFlight = runLegacyPhotoMigration().finally(() => {
+    migrationInFlight = null;
+  });
+
+  return migrationInFlight;
+}
+
+async function runLegacyPhotoMigration() {
+  const summary = {
+    scanned: 0,
+    migrated: 0,
+    alreadyIndexed: 0,
+    skippedInvalidName: 0,
+    failed: 0,
+    errors: [],
+  };
+
+  // Requirement 1: ensure the directory exists / handle it being absent
+  // safely. Reuses the same mkdir-if-missing logic saveMemberPhoto() uses;
+  // if the directory truly doesn't exist there is simply nothing to scan.
+  await ensureDir("migration");
+
+  const entries = await listMemberPhotoDirEntries();
+
+  // Read the index ONCE up front (instead of once per file) so we know
+  // which memberIds already have metadata before doing any of the
+  // expensive per-file read/hash work below.
+  let existingPhotos = {};
+
+  try {
+    const currentIndex = await getPhotoIndex();
+    existingPhotos = currentIndex?.photos || {};
+  } catch (error) {
+    logMigrationWarning(
+      "could not read existing index before scanning — treating as empty for this scan",
+      { directory: STORAGE_DIRECTORY },
+      error
+    );
+  }
+
+  // Build the full set of candidates ENTIRELY in memory first — no index
+  // write happens until every file has been scanned/hashed.
+  const candidates = [];
+
+  for (const fileName of entries) {
+    const match = LEGACY_PHOTO_FILENAME_RE.exec(fileName);
+
+    if (!match) {
+      // Not a "<memberId>.jpg" file (could be a stray/system file) —
+      // leave it alone, it's not ours to migrate.
+      summary.skippedInvalidName += 1;
+      continue;
+    }
+
+    summary.scanned += 1;
+    const memberId = match[1];
+
+    if (Object.prototype.hasOwnProperty.call(existingPhotos, memberId)) {
+      // Metadata already present and valid — per the migration contract,
+      // do not touch version/updatedAt/hash for it.
+      summary.alreadyIndexed += 1;
+      continue;
+    }
+
+    const path = pathFor(memberId);
+    let rawBase64;
+
+    try {
+      rawBase64 = await readStoredRawBase64(memberId);
+    } catch (error) {
+      logMigrationWarning(
+        "legacy photo file could not be read — leaving file untouched, skipping index entry",
+        { memberId, path, directory: STORAGE_DIRECTORY },
+        error
+      );
+      summary.failed += 1;
+      summary.errors.push({ memberId, reason: "unreadable" });
+      continue;
+    }
+
+    if (!rawBase64) {
+      logMigrationWarning(
+        "legacy photo file is empty — leaving file untouched, skipping index entry",
+        { memberId, path, directory: STORAGE_DIRECTORY }
+      );
+      summary.failed += 1;
+      summary.errors.push({ memberId, reason: "empty" });
+      continue;
+    }
+
+    let hash = "";
+
+    try {
+      hash = await sha256Base64(rawBase64);
+    } catch (error) {
+      // Hashing isn't strictly required to register a legacy photo — a
+      // missing hash just means this entry will never spuriously match
+      // "same" against a remote photo by hash alone (it'll still be
+      // compared by version/updatedAt/hash in comparePhotoIndexes). We
+      // still register it so it's visible to sync at all.
+      logMigrationWarning(
+        "could not hash legacy photo (registering metadata without a hash)",
+        { memberId, path, directory: STORAGE_DIRECTORY },
+        error
+      );
+    }
+
+    candidates.push({
+      memberId,
+      fileName: `${memberId}.jpg`,
+      path,
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      hash,
+    });
+  }
+
+  if (candidates.length === 0) {
+    return summary;
+  }
+
+  // Requirement: read index once, write index once — commit every migrated
+  // photo's metadata in a SINGLE serialized read-modify-write cycle rather
+  // than one per photo. upsertManyPhotoMetadata() goes through the same
+  // write queue as saveMemberPhoto()'s metadata updates, so this can never
+  // interleave with (and lose) a concurrent new-photo save. skipExisting
+  // re-checks against the LIVE index at write time, so a memberId that
+  // gained metadata after our snapshot above (e.g. the user took a new
+  // photo for that member while this scan was still running) is left
+  // completely untouched here rather than being overwritten.
+  try {
+    const { updated, skipped } = await upsertManyPhotoMetadata(candidates, {
+      skipExisting: true,
+    });
+
+    updated.forEach((memberId) => invalidatePhotoCache(memberId));
+
+    summary.migrated += updated.length;
+    summary.alreadyIndexed += skipped.length;
+  } catch (error) {
+    // The batch write itself failed (e.g. a genuine Filesystem/writeFile
+    // error). Every candidate scanned this run is affected — log once with
+    // full structured detail (not "[object Object]") and report them as
+    // failed rather than silently pretending they migrated. Photo files
+    // are untouched either way; this only ever affects index.json.
+    logMigrationWarning(
+      "unexpected error migrating legacy photos — leaving files untouched, skipping index entries",
+      {
+        memberIds: candidates.map((candidate) => candidate.memberId),
+        directory: STORAGE_DIRECTORY,
+      },
+      error
+    );
+    summary.failed += candidates.length;
+    candidates.forEach((candidate) =>
+      summary.errors.push({
+        memberId: candidate.memberId,
+        reason: "unexpected-error",
+      })
+    );
+  }
+
+  return summary;
+}
+
 /**
  * Returns a displayable data URL for a locally stored member photo.
+ *
+ * PHASE 4A — in-flight request dedup (TASK 1):
+ * If a read for this memberId is already in progress, every caller shares
+ * that same Promise instead of triggering another Filesystem.readFile().
+ * Exactly one native read happens no matter how many components ask for
+ * the same member's photo at (roughly) the same time.
+ *
+ * PHASE 4A — stale-read race protection (TASK 2 / TASK 9):
+ * The generation token captured at the start of the read is compared
+ * against the current token once the read finishes. If saveMemberPhoto()
+ * or deleteMemberPhoto() ran in the meantime, the token will have moved on
+ * and this (now-stale) result is simply returned to whoever awaited it
+ * without being written into photoCache — so it can never clobber a newer
+ * save. A subsequent getMemberPhoto() call will do a fresh read and pick
+ * up the correct value.
  */
 export async function getMemberPhoto(memberId) {
   if (!memberId) return null;
 
   const key = String(memberId);
 
+  // 1. Resolved-value cache hit — no filesystem work at all.
   if (photoCache.has(key)) {
     return photoCache.get(key);
   }
 
-  try {
-    const result = await Filesystem.readFile({
-      path: pathFor(key),
-      directory: STORAGE_DIRECTORY,
-    });
-
-    const dataUrl = result?.data
-      ? `data:image/jpeg;base64,${result.data}`
-      : null;
-
-    photoCache.set(key, dataUrl);
-
-    return dataUrl;
-  } catch {
-    photoCache.set(key, null);
-    return null;
+  // 2. A read for this member is already in flight — share it.
+  if (photoLoadPromises.has(key)) {
+    return photoLoadPromises.get(key);
   }
+
+  // 3. Otherwise, kick off exactly one read and remember the generation
+  // this read started at, so we can detect a concurrent save/delete.
+  const generationAtStart = photoGeneration.get(key) || 0;
+
+  const loadPromise = (async () => {
+    try {
+      const result = await Filesystem.readFile({
+        path: pathFor(key),
+        directory: STORAGE_DIRECTORY,
+      });
+
+      const dataUrl = result?.data
+        ? `data:image/jpeg;base64,${result.data}`
+        : null;
+
+      if ((photoGeneration.get(key) || 0) === generationAtStart) {
+        photoCache.set(key, dataUrl);
+      }
+      // else: a save/delete landed while this read was in flight — the
+      // cache has already been (or will be) populated correctly by that
+      // operation, so we must not overwrite it with this stale result.
+
+      return dataUrl;
+    } catch {
+      // Missing photo is normal (TASK 6) — resolve to null, don't throw.
+      if ((photoGeneration.get(key) || 0) === generationAtStart) {
+        photoCache.set(key, null);
+      }
+      return null;
+    } finally {
+      // 4. Clear the in-flight entry once settled — Promises are never
+      // kept around after the request finishes (TASK 7).
+      //
+      // IMPORTANT: only remove the map entry if it still points at THIS
+      // promise. invalidatePhotoCache() (save/delete) already deletes the
+      // entry for this key when it runs, so if a NEWER read (P2) started
+      // after that invalidation and is now in flight, photoLoadPromises
+      // will point at P2's promise by the time P1 (this one) settles. In
+      // that case P1 must NOT delete P2's entry — doing so would let a
+      // third caller start a redundant P3 while P2 is still in progress.
+      if (photoLoadPromises.get(key) === loadPromise) {
+        photoLoadPromises.delete(key);
+      }
+    }
+  })();
+
+  photoLoadPromises.set(key, loadPromise);
+  return loadPromise;
 }
 
 export async function hasMemberPhoto(memberId) {
@@ -418,7 +812,7 @@ export async function deleteMemberPhoto(memberId) {
     );
   }
 
-  photoCache.delete(key);
+  invalidatePhotoCache(key);
   notify(key);
 
   return true;
